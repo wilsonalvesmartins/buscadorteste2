@@ -5,6 +5,7 @@ import {
   CalendarDays,
   ChevronLeft,
   ChevronRight,
+  Download,
   FileSearch,
   FileText,
   IdCard,
@@ -121,6 +122,7 @@ const ALL_TRIBUNALS_LABEL = "Todos os tribunais";
 const ALL_TRIBUNALS_CONCURRENCY = 5;
 const SEARCH_MODES = [
   { value: "processo", label: "Processo" },
+  { value: "nome", label: "Nome" },
   { value: "oab", label: "OAB" },
   { value: "termo", label: "Termo" }
 ];
@@ -170,6 +172,10 @@ function buildOabVariants(numero, uf) {
     `OAB ${cleanNumber} ${cleanUf}`,
     `OAB ${cleanNumber}/${cleanUf}`
   ];
+}
+
+function escapeQueryString(value) {
+  return value.replace(/([+\-=&|><!(){}\[\]^"~*?:\\/])/g, "\\$1");
 }
 
 function buildSearchBody({ searchMode, termo, oabNumero, oabUf, dataInicio, dataFim, page, pageSize }) {
@@ -235,7 +241,45 @@ function buildSearchBody({ searchMode, termo, oabNumero, oabUf, dataInicio, data
         minimum_should_match: 1
       }
     });
+  } else if (searchMode === "nome" && trimmedTerm) {
+    const safeTerm = escapeQueryString(trimmedTerm);
+
+    must.push({
+      bool: {
+        should: [
+          {
+            query_string: {
+              query: `"${safeTerm}"`,
+              fields: ["*"],
+              default_operator: "AND",
+              lenient: true
+            }
+          },
+          {
+            multi_match: {
+              query: trimmedTerm,
+              fields: [
+                "*.nome^3",
+                "*.descricao^2",
+                "movimentos.nome^2",
+                "movimentos.complementosTabelados.nome^2",
+                "movimentos.complementosTabelados.descricao^2",
+                "orgaoJulgador.nome",
+                "classe.nome",
+                "assuntos.nome"
+              ],
+              operator: "and",
+              type: "best_fields",
+              lenient: true
+            }
+          }
+        ],
+        minimum_should_match: 1
+      }
+    });
   } else if (trimmedTerm) {
+    const safeTerm = escapeQueryString(trimmedTerm);
+
     must.push({
       bool: {
         should: [
@@ -257,7 +301,7 @@ function buildSearchBody({ searchMode, termo, oabNumero, oabUf, dataInicio, data
           },
           {
             query_string: {
-              query: `"${trimmedTerm}"`,
+              query: `"${safeTerm}"`,
               fields: ["*"],
               lenient: true
             }
@@ -325,17 +369,7 @@ function buildSearchBody({ searchMode, termo, oabNumero, oabUf, dataInicio, data
         filter
       }
     },
-    _source: [
-      "numeroProcesso",
-      "classe.nome",
-      "assuntos.nome",
-      "orgaoJulgador.nome",
-      "sistema.nome",
-      "grau",
-      "dataAjuizamento",
-      "dataHoraUltimaAtualizacao",
-      "movimentos"
-    ]
+    _source: true
   };
 }
 
@@ -470,6 +504,79 @@ async function runWithConcurrency(items, limit, task, onProgress) {
   return output;
 }
 
+function csvCell(value) {
+  if (value === null || value === undefined) {
+    return "";
+  }
+
+  const text = String(value).replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+  return `"${text.replace(/"/g, '""')}"`;
+}
+
+function toCsv(headers, rows) {
+  return [
+    headers.map(csvCell).join(";"),
+    ...rows.map((row) => headers.map((header) => csvCell(row[header])).join(";"))
+  ].join("\n");
+}
+
+function getReportTimestamp() {
+  return new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "");
+}
+
+function downloadTextFile(filename, content, type) {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function buildProcessRows(hits) {
+  return hits.map((hit) => {
+    const source = hit._source ?? {};
+    const movements = getMovements(source.movimentos);
+    const lastMovement = movements[0];
+
+    return {
+      tribunal: hit._tribunalLabel ?? hit._tribunal ?? "",
+      numeroProcesso: source.numeroProcesso ?? "",
+      classe: source.classe?.nome ?? "",
+      assuntos: getNames(source.assuntos),
+      orgaoJulgador: source.orgaoJulgador?.nome ?? "",
+      sistema: source.sistema?.nome ?? "",
+      grau: source.grau ?? "",
+      dataAjuizamento: source.dataAjuizamento ?? "",
+      dataHoraUltimaAtualizacao: source.dataHoraUltimaAtualizacao ?? "",
+      quantidadeMovimentos: movements.length,
+      ultimoMovimentoData: lastMovement?.dataHora ?? "",
+      ultimoMovimento: lastMovement?.nome ?? ""
+    };
+  });
+}
+
+function buildMovementRows(hits) {
+  return hits.flatMap((hit) => {
+    const source = hit._source ?? {};
+    const movements = getMovements(source.movimentos);
+
+    return movements.map((movement, index) => ({
+      tribunal: hit._tribunalLabel ?? hit._tribunal ?? "",
+      numeroProcesso: source.numeroProcesso ?? "",
+      sequencia: index + 1,
+      dataHora: movement?.dataHora ?? "",
+      movimento: movement?.nome ?? "",
+      complementos: getComplementosText(movement?.complementosTabelados),
+      classe: source.classe?.nome ?? "",
+      orgaoJulgador: source.orgaoJulgador?.nome ?? ""
+    }));
+  });
+}
+
 export default function App() {
   const [tribunal, setTribunal] = useState("tjsp");
   const [searchMode, setSearchMode] = useState("processo");
@@ -509,9 +616,13 @@ export default function App() {
   const pageCount = isAllTribunals
     ? Math.max(1, Math.ceil(results.length / pageSize))
     : Math.max(1, Math.ceil(total / pageSize));
-  const inputLabel = searchMode === "processo" ? "Numero do processo" : "Termo de pesquisa";
+  const inputLabel = searchMode === "processo" ? "Numero do processo" : searchMode === "nome" ? "Nome" : "Termo de pesquisa";
   const inputPlaceholder =
-    searchMode === "processo" ? "Ex: 0012045-65.2025.5.15.0083" : "Ex: intimacao, audiencia ou nome do orgao";
+    searchMode === "processo"
+      ? "Ex: 0012045-65.2025.5.15.0083"
+      : searchMode === "nome"
+        ? "Ex: Maria Silva ou Empresa LTDA"
+        : "Ex: intimacao, audiencia ou nome do orgao";
 
   async function runSearch(nextPage = 0) {
     if (searchMode === "oab" && (!oabNumero.trim() || !oabUf)) {
@@ -649,6 +760,55 @@ export default function App() {
     }
   }
 
+  function downloadProcessCsv() {
+    const headers = [
+      "tribunal",
+      "numeroProcesso",
+      "classe",
+      "assuntos",
+      "orgaoJulgador",
+      "sistema",
+      "grau",
+      "dataAjuizamento",
+      "dataHoraUltimaAtualizacao",
+      "quantidadeMovimentos",
+      "ultimoMovimentoData",
+      "ultimoMovimento"
+    ];
+    const csv = `\ufeff${toCsv(headers, buildProcessRows(results))}`;
+    downloadTextFile(`datajud-processos-${getReportTimestamp()}.csv`, csv, "text/csv;charset=utf-8");
+  }
+
+  function downloadMovementsCsv() {
+    const headers = ["tribunal", "numeroProcesso", "sequencia", "dataHora", "movimento", "complementos", "classe", "orgaoJulgador"];
+    const csv = `\ufeff${toCsv(headers, buildMovementRows(results))}`;
+    downloadTextFile(`datajud-movimentacoes-${getReportTimestamp()}.csv`, csv, "text/csv;charset=utf-8");
+  }
+
+  function downloadJsonReport() {
+    const report = {
+      exportedAt: new Date().toISOString(),
+      search: {
+        tribunal: selectedTribunal?.label ?? tribunal,
+        searchMode,
+        termo,
+        oabNumero,
+        oabUf,
+        dataInicio,
+        dataFim,
+        totalEncontrado: total,
+        resultadosCarregados: results.length
+      },
+      results
+    };
+
+    downloadTextFile(
+      `datajud-completo-${getReportTimestamp()}.json`,
+      JSON.stringify(report, null, 2),
+      "application/json;charset=utf-8"
+    );
+  }
+
   return (
     <main className="min-h-screen bg-[#f5f7fb] text-ink">
       <section className="border-b border-slate-200 bg-white">
@@ -685,7 +845,7 @@ export default function App() {
           <div className="mb-5 flex items-center justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold text-slate-950">Parametros</h2>
-              <p className="mt-1 text-sm text-slate-600">Use numero CNJ, OAB/UF ou termo publico.</p>
+              <p className="mt-1 text-sm text-slate-600">Use numero CNJ, nome, OAB/UF ou termo publico.</p>
             </div>
             <button
               type="button"
@@ -701,7 +861,7 @@ export default function App() {
           <div className="space-y-4">
             <div>
               <span className="mb-1.5 block text-sm font-medium text-slate-700">Tipo de busca</span>
-              <div className="grid grid-cols-3 rounded-lg border border-slate-300 bg-slate-50 p-1">
+              <div className="grid grid-cols-4 rounded-lg border border-slate-300 bg-slate-50 p-1">
                 {SEARCH_MODES.map((mode) => (
                   <button
                     key={mode.value}
@@ -805,6 +965,12 @@ export default function App() {
               </div>
             )}
 
+            {searchMode === "nome" && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                A busca por nome consulta campos publicos retornados pelo Datajud. Nomes de partes e advogados nem sempre sao expostos pela API publica.
+              </div>
+            )}
+
             {isAllTribunals && (
               <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
                 A busca em todos os tribunais consulta {TRIBUNAIS.length} bases em lotes de {ALL_TRIBUNALS_CONCURRENCY}. Pode levar alguns segundos.
@@ -875,7 +1041,14 @@ export default function App() {
               <p className="text-sm font-medium text-slate-500">Tribunal selecionado</p>
               <h2 className="mt-1 text-xl font-semibold text-slate-950">{selectedTribunal?.label}</h2>
               <p className="mt-1 text-sm text-slate-600">
-                Busca atual: {searchMode === "oab" ? `OAB ${oabUf} ${oabNumero || "-"}` : searchMode === "processo" ? "numero CNJ" : "termo livre"}
+                Busca atual:{" "}
+                {searchMode === "oab"
+                  ? `OAB ${oabUf} ${oabNumero || "-"}`
+                  : searchMode === "processo"
+                    ? "numero CNJ"
+                    : searchMode === "nome"
+                      ? "nome"
+                      : "termo livre"}
               </p>
             </div>
             <div className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">
@@ -896,6 +1069,41 @@ export default function App() {
           {searchInfo && !error && (
             <div className="mb-4 rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
               {searchInfo}
+            </div>
+          )}
+
+          {!loading && results.length > 0 && (
+            <div className="mb-4 flex flex-col gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-soft sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-semibold text-slate-950">Relatorios</p>
+                <p className="mt-1 text-xs text-slate-600">Baixe os processos carregados, as movimentacoes ou o JSON completo retornado pela API.</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={downloadProcessCsv}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-slate-300 px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+                >
+                  <Download className="h-4 w-4" aria-hidden="true" />
+                  Processos CSV
+                </button>
+                <button
+                  type="button"
+                  onClick={downloadMovementsCsv}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-slate-300 px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+                >
+                  <Download className="h-4 w-4" aria-hidden="true" />
+                  Movimentos CSV
+                </button>
+                <button
+                  type="button"
+                  onClick={downloadJsonReport}
+                  className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-slate-900 px-3 text-sm font-medium text-white transition hover:bg-slate-800"
+                >
+                  <Download className="h-4 w-4" aria-hidden="true" />
+                  JSON completo
+                </button>
+              </div>
             </div>
           )}
 
@@ -922,7 +1130,7 @@ export default function App() {
               <Search className="mx-auto h-10 w-10 text-slate-400" aria-hidden="true" />
               <h3 className="mt-3 text-lg font-semibold text-slate-950">Nenhum resultado</h3>
               <p className="mt-2 text-sm text-slate-600">
-                Ajuste o termo, tribunal ou periodo. Para OAB, tente tambem sem filtro de datas.
+                Ajuste o termo, tribunal ou periodo. Para OAB e nome, tente tambem sem filtro de datas e em todos os tribunais.
               </p>
             </div>
           )}
