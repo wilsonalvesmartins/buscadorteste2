@@ -116,6 +116,9 @@ const TRIBUNAIS = [
 ];
 
 const DEFAULT_PAGE_SIZE = 10;
+const ALL_TRIBUNALS_VALUE = "__all__";
+const ALL_TRIBUNALS_LABEL = "Todos os tribunais";
+const ALL_TRIBUNALS_CONCURRENCY = 5;
 const SEARCH_MODES = [
   { value: "processo", label: "Processo" },
   { value: "oab", label: "OAB" },
@@ -331,12 +334,33 @@ function buildSearchBody({ searchMode, termo, oabNumero, oabUf, dataInicio, data
       "grau",
       "dataAjuizamento",
       "dataHoraUltimaAtualizacao",
-      "movimentos.nome",
-      "movimentos.dataHora",
-      "movimentos.complementosTabelados.nome",
-      "movimentos.complementosTabelados.descricao"
+      "movimentos"
     ]
   };
+}
+
+async function fetchDatajudSearch(tribunalValue, body) {
+  const response = await fetch(`/api-datajud/api_publica_${tribunalValue}/_search`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: DATAJUD_API_KEY
+    },
+    body: JSON.stringify(body)
+  });
+
+  const contentType = response.headers.get("content-type") || "";
+  const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+
+  if (!response.ok) {
+    const message =
+      typeof payload === "string"
+        ? payload
+        : payload?.error?.reason || payload?.message || "A API do Datajud retornou erro.";
+    throw new Error(message);
+  }
+
+  return payload;
 }
 
 function formatDate(value) {
@@ -376,7 +400,74 @@ function getLastMovement(movimentos) {
     return null;
   }
 
-  return movimentos[movimentos.length - 1];
+  return getMovements(movimentos)[0] ?? null;
+}
+
+function getMovements(movimentos) {
+  if (!Array.isArray(movimentos)) {
+    return [];
+  }
+
+  return [...movimentos].sort((first, second) => {
+    const firstTime = new Date(first?.dataHora ?? 0).getTime();
+    const secondTime = new Date(second?.dataHora ?? 0).getTime();
+    return (Number.isNaN(secondTime) ? 0 : secondTime) - (Number.isNaN(firstTime) ? 0 : firstTime);
+  });
+}
+
+function getComplementosText(complementos) {
+  if (!Array.isArray(complementos) || complementos.length === 0) {
+    return "";
+  }
+
+  return complementos
+    .map((complemento) => [complemento?.nome, complemento?.descricao].filter(Boolean).join(" - "))
+    .filter(Boolean)
+    .join(" | ");
+}
+
+function getHitTimestamp(hit) {
+  const value = hit?._source?.dataHoraUltimaAtualizacao || hit?._source?.dataAjuizamento;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 0 : date.getTime();
+}
+
+function getTribunalByValue(value) {
+  return TRIBUNAIS.find((item) => item.value === value);
+}
+
+function enrichHits(hits, tribunalInfo) {
+  return hits.map((hit) => ({
+    ...hit,
+    _resultKey: `${tribunalInfo.value}-${hit._id}`,
+    _tribunal: tribunalInfo.value,
+    _tribunalLabel: tribunalInfo.label
+  }));
+}
+
+async function runWithConcurrency(items, limit, task, onProgress) {
+  const output = [];
+  let cursor = 0;
+  let completed = 0;
+
+  async function worker() {
+    while (cursor < items.length) {
+      const item = items[cursor];
+      cursor += 1;
+
+      try {
+        output.push({ status: "fulfilled", value: await task(item), item });
+      } catch (reason) {
+        output.push({ status: "rejected", reason, item });
+      } finally {
+        completed += 1;
+        onProgress?.(completed, items.length);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return output;
 }
 
 export default function App() {
@@ -395,6 +486,7 @@ export default function App() {
   const [searched, setSearched] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [searchInfo, setSearchInfo] = useState("");
 
   const groupedTribunais = useMemo(() => {
     return TRIBUNAIS.reduce((groups, item) => {
@@ -406,9 +498,17 @@ export default function App() {
     }, {});
   }, []);
 
-  const selectedTribunal = TRIBUNAIS.find((item) => item.value === tribunal);
-  const endpoint = `/api-datajud/api_publica_${tribunal}/_search`;
-  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const isAllTribunals = tribunal === ALL_TRIBUNALS_VALUE;
+  const selectedTribunal = isAllTribunals
+    ? { label: ALL_TRIBUNALS_LABEL, value: ALL_TRIBUNALS_VALUE }
+    : getTribunalByValue(tribunal);
+  const endpoint = isAllTribunals
+    ? `/api-datajud/api_publica_{tribunal}/_search em ${TRIBUNAIS.length} tribunais`
+    : `/api-datajud/api_publica_${tribunal}/_search`;
+  const displayedResults = isAllTribunals ? results.slice(page * pageSize, page * pageSize + pageSize) : results;
+  const pageCount = isAllTribunals
+    ? Math.max(1, Math.ceil(results.length / pageSize))
+    : Math.max(1, Math.ceil(total / pageSize));
   const inputLabel = searchMode === "processo" ? "Numero do processo" : "Termo de pesquisa";
   const inputPlaceholder =
     searchMode === "processo" ? "Ex: 0012045-65.2025.5.15.0083" : "Ex: intimacao, audiencia ou nome do orgao";
@@ -423,11 +523,21 @@ export default function App() {
       return;
     }
 
+    if (isAllTribunals && searchMode !== "oab" && !termo.trim()) {
+      setSearched(true);
+      setResults([]);
+      setTotal(0);
+      setTook(null);
+      setError("Informe um numero de processo ou termo antes de buscar em todos os tribunais.");
+      return;
+    }
+
     setLoading(true);
     setError("");
+    setSearchInfo(isAllTribunals ? `Consultando 0/${TRIBUNAIS.length} tribunais...` : "");
     setSearched(true);
 
-    const body = buildSearchBody({
+    const searchArgs = {
       searchMode,
       termo,
       oabNumero,
@@ -436,38 +546,70 @@ export default function App() {
       dataFim,
       page: nextPage,
       pageSize
-    });
+    };
 
     try {
-      const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: DATAJUD_API_KEY
-        },
-        body: JSON.stringify(body)
-      });
+      if (isAllTribunals) {
+        const startedAt = performance.now();
+        const perTribunalPageSize = searchMode === "processo" ? 1 : Math.min(pageSize, 10);
+        const body = buildSearchBody({
+          ...searchArgs,
+          page: 0,
+          pageSize: perTribunalPageSize
+        });
 
-      const contentType = response.headers.get("content-type") || "";
-      const payload = contentType.includes("application/json") ? await response.json() : await response.text();
+        const responses = await runWithConcurrency(
+          TRIBUNAIS,
+          ALL_TRIBUNALS_CONCURRENCY,
+          async (tribunalInfo) => {
+            const payload = await fetchDatajudSearch(tribunalInfo.value, body);
+            return { tribunalInfo, payload };
+          },
+          (done, totalItems) => {
+            setSearchInfo(`Consultando ${done}/${totalItems} tribunais...`);
+          }
+        );
 
-      if (!response.ok) {
-        const message =
-          typeof payload === "string"
-            ? payload
-            : payload?.error?.reason || payload?.message || "A API do Datajud retornou erro.";
-        throw new Error(message);
+        const successful = responses.filter((item) => item.status === "fulfilled");
+        const failed = responses.filter((item) => item.status === "rejected");
+
+        if (successful.length === 0) {
+          throw new Error("Nenhum tribunal respondeu a consulta. Tente novamente em instantes.");
+        }
+
+        const allHits = successful
+          .flatMap(({ value }) => {
+            const hits = value.payload?.hits?.hits ?? [];
+            return enrichHits(hits, value.tribunalInfo);
+          })
+          .sort((first, second) => getHitTimestamp(second) - getHitTimestamp(first));
+
+        const totalHits = successful.reduce((sum, { value }) => sum + getTotalHits(value.payload?.hits?.total), 0);
+        setResults(allHits);
+        setTotal(totalHits);
+        setTook(Math.round(performance.now() - startedAt));
+        setPage(0);
+        setSearchInfo(
+          `Consulta concluida em ${successful.length}/${TRIBUNAIS.length} tribunais. ${allHits.length.toLocaleString(
+            "pt-BR"
+          )} resultado(s) carregado(s) para exibicao${failed.length ? `; ${failed.length} tribunal(is) falharam` : ""}.`
+        );
+        return;
       }
 
+      const body = buildSearchBody(searchArgs);
+      const payload = await fetchDatajudSearch(tribunal, body);
       const hits = payload?.hits?.hits ?? [];
-      setResults(hits);
+      setResults(enrichHits(hits, selectedTribunal ?? { value: tribunal, label: tribunal.toUpperCase() }));
       setTotal(getTotalHits(payload?.hits?.total));
       setTook(payload?.took ?? null);
       setPage(nextPage);
+      setSearchInfo("");
     } catch (err) {
       setResults([]);
       setTotal(0);
       setTook(null);
+      setSearchInfo("");
       setError(err instanceof Error ? err.message : "Nao foi possivel consultar o Datajud.");
     } finally {
       setLoading(false);
@@ -493,12 +635,17 @@ export default function App() {
     setTook(null);
     setSearched(false);
     setError("");
+    setSearchInfo("");
   }
 
   function goToPage(nextPage) {
     const boundedPage = Math.min(Math.max(nextPage, 0), pageCount - 1);
     if (boundedPage !== page) {
-      runSearch(boundedPage);
+      if (isAllTribunals) {
+        setPage(boundedPage);
+      } else {
+        runSearch(boundedPage);
+      }
     }
   }
 
@@ -581,9 +728,19 @@ export default function App() {
               </span>
               <select
                 value={tribunal}
-                onChange={(event) => setTribunal(event.target.value)}
+                onChange={(event) => {
+                  setTribunal(event.target.value);
+                  setPage(0);
+                  setResults([]);
+                  setTotal(0);
+                  setTook(null);
+                  setSearched(false);
+                  setError("");
+                  setSearchInfo("");
+                }}
                 className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none ring-emerald-100 transition focus:border-emerald-600 focus:ring-4"
               >
+                <option value={ALL_TRIBUNALS_VALUE}>{ALL_TRIBUNALS_LABEL}</option>
                 {Object.entries(groupedTribunais).map(([group, items]) => (
                   <optgroup key={group} label={group}>
                     {items.map((item) => (
@@ -645,6 +802,12 @@ export default function App() {
             {searchMode === "oab" && (
               <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
                 A busca por OAB procura referencias publicas nos metadados e movimentos. A API publica do Datajud nao expoe OAB como campo estruturado garantido.
+              </div>
+            )}
+
+            {isAllTribunals && (
+              <div className="rounded-lg border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">
+                A busca em todos os tribunais consulta {TRIBUNAIS.length} bases em lotes de {ALL_TRIBUNALS_CONCURRENCY}. Pode levar alguns segundos.
               </div>
             )}
 
@@ -730,6 +893,12 @@ export default function App() {
             </div>
           )}
 
+          {searchInfo && !error && (
+            <div className="mb-4 rounded-lg border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+              {searchInfo}
+            </div>
+          )}
+
           {!searched && !loading && (
             <div className="rounded-lg border border-dashed border-slate-300 bg-white px-6 py-12 text-center shadow-soft">
               <FileText className="mx-auto h-10 w-10 text-emerald-700" aria-hidden="true" />
@@ -744,7 +913,7 @@ export default function App() {
             <div className="rounded-lg border border-slate-200 bg-white px-6 py-12 text-center shadow-soft">
               <Loader2 className="mx-auto h-10 w-10 animate-spin text-emerald-700" aria-hidden="true" />
               <h3 className="mt-3 text-lg font-semibold text-slate-950">Consultando Datajud</h3>
-              <p className="mt-2 text-sm text-slate-600">Aguarde a resposta da API publica do CNJ.</p>
+              <p className="mt-2 text-sm text-slate-600">{searchInfo || "Aguarde a resposta da API publica do CNJ."}</p>
             </div>
           )}
 
@@ -761,18 +930,22 @@ export default function App() {
           {!loading && results.length > 0 && (
             <>
               <div className="space-y-4">
-                {results.map((hit) => {
+                {displayedResults.map((hit) => {
                   const source = hit._source ?? {};
                   const lastMovement = getLastMovement(source.movimentos);
+                  const movements = getMovements(source.movimentos);
 
                   return (
-                    <article key={hit._id} className="rounded-lg border border-slate-200 bg-white p-5 shadow-soft">
+                    <article key={hit._resultKey ?? hit._id} className="rounded-lg border border-slate-200 bg-white p-5 shadow-soft">
                       <div className="flex flex-col gap-3 border-b border-slate-100 pb-4 sm:flex-row sm:items-start sm:justify-between">
                         <div>
                           <p className="text-xs font-semibold uppercase tracking-normal text-emerald-700">Processo</p>
                           <h3 className="mt-1 break-all text-xl font-semibold text-slate-950">
                             {source.numeroProcesso ?? "Numero nao informado"}
                           </h3>
+                          {hit._tribunalLabel && (
+                            <p className="mt-1 text-sm text-slate-600">{hit._tribunalLabel}</p>
+                          )}
                         </div>
                         <span className="inline-flex w-fit items-center rounded-lg bg-slate-100 px-3 py-1 text-sm font-medium text-slate-700">
                           Score {hit._score?.toFixed?.(2) ?? "-"}
@@ -815,15 +988,45 @@ export default function App() {
                           <p className="mt-1 text-xs text-emerald-800">{formatDate(lastMovement.dataHora)}</p>
                         </div>
                       )}
+
+                      {movements.length > 0 && (
+                        <details className="mt-4 rounded-lg border border-slate-200 bg-slate-50 px-4 py-3" open={searchMode === "processo"}>
+                          <summary className="cursor-pointer text-sm font-semibold text-slate-900">
+                            Todas as movimentacoes ({movements.length})
+                          </summary>
+                          <ol className="mt-3 max-h-[520px] space-y-3 overflow-auto pr-2">
+                            {movements.map((movement, index) => {
+                              const complementosText = getComplementosText(movement?.complementosTabelados);
+
+                              return (
+                                <li key={`${movement?.dataHora ?? "sem-data"}-${index}`} className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                                  <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+                                    <p className="text-sm font-medium text-slate-950">{movement?.nome ?? "Movimento sem descricao"}</p>
+                                    <time className="shrink-0 text-xs text-slate-500">{formatDate(movement?.dataHora)}</time>
+                                  </div>
+                                  {complementosText && <p className="mt-2 text-xs text-slate-600">{complementosText}</p>}
+                                </li>
+                              );
+                            })}
+                          </ol>
+                        </details>
+                      )}
                     </article>
                   );
                 })}
               </div>
 
               <div className="mt-5 flex flex-col gap-3 rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-soft sm:flex-row sm:items-center sm:justify-between">
-                <p className="text-sm text-slate-600">
-                  Pagina {page + 1} de {pageCount.toLocaleString("pt-BR")}
-                </p>
+                <div className="text-sm text-slate-600">
+                  <p>
+                    Pagina {page + 1} de {pageCount.toLocaleString("pt-BR")}
+                  </p>
+                  {isAllTribunals && (
+                    <p className="mt-1">
+                      Exibindo {results.length.toLocaleString("pt-BR")} resultado(s) carregado(s) de {total.toLocaleString("pt-BR")} encontrado(s).
+                    </p>
+                  )}
+                </div>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
