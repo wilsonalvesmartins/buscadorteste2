@@ -7,6 +7,7 @@ import {
   ChevronRight,
   FileSearch,
   FileText,
+  IdCard,
   Loader2,
   RefreshCw,
   Search,
@@ -115,32 +116,151 @@ const TRIBUNAIS = [
 ];
 
 const DEFAULT_PAGE_SIZE = 10;
+const SEARCH_MODES = [
+  { value: "processo", label: "Processo" },
+  { value: "oab", label: "OAB" },
+  { value: "termo", label: "Termo" }
+];
+const UF_OPTIONS = [
+  "AC",
+  "AL",
+  "AM",
+  "AP",
+  "BA",
+  "CE",
+  "DF",
+  "ES",
+  "GO",
+  "MA",
+  "MG",
+  "MS",
+  "MT",
+  "PA",
+  "PB",
+  "PE",
+  "PI",
+  "PR",
+  "RJ",
+  "RN",
+  "RO",
+  "RR",
+  "RS",
+  "SC",
+  "SE",
+  "SP",
+  "TO"
+];
 
-function buildSearchBody({ termo, dataInicio, dataFim, page, pageSize }) {
+function buildOabVariants(numero, uf) {
+  const cleanNumber = numero.replace(/\D/g, "");
+  const cleanUf = uf.trim().toUpperCase();
+
+  return [
+    `${cleanUf}${cleanNumber}`,
+    `${cleanUf} ${cleanNumber}`,
+    `${cleanNumber}${cleanUf}`,
+    `${cleanNumber} ${cleanUf}`,
+    `${cleanNumber}/${cleanUf}`,
+    `${cleanNumber}-${cleanUf}`,
+    `OAB ${cleanUf} ${cleanNumber}`,
+    `OAB/${cleanUf} ${cleanNumber}`,
+    `OAB ${cleanNumber} ${cleanUf}`,
+    `OAB ${cleanNumber}/${cleanUf}`
+  ];
+}
+
+function buildSearchBody({ searchMode, termo, oabNumero, oabUf, dataInicio, dataFim, page, pageSize }) {
   const trimmedTerm = termo.trim();
   const digitsOnly = trimmedTerm.replace(/\D/g, "");
+  const oabDigits = oabNumero.replace(/\D/g, "");
   const must = [];
   const filter = [];
 
-  if (digitsOnly.length >= 12) {
+  if (searchMode === "oab" && oabDigits && oabUf) {
+    const variants = buildOabVariants(oabNumero, oabUf);
+
     must.push({
-      match: {
-        numeroProcesso: digitsOnly
+      bool: {
+        should: [
+          {
+            query_string: {
+              query: variants.map((variant) => `"${variant}"`).join(" OR "),
+              fields: ["*"],
+              default_operator: "OR",
+              lenient: true
+            }
+          },
+          {
+            bool: {
+              must: [
+                {
+                  query_string: {
+                    query: `"${oabDigits}"`,
+                    fields: ["*"],
+                    lenient: true
+                  }
+                },
+                {
+                  query_string: {
+                    query: `"${oabUf}"`,
+                    fields: ["*"],
+                    lenient: true
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        minimum_should_match: 1
+      }
+    });
+  } else if (searchMode === "processo" && digitsOnly) {
+    must.push({
+      bool: {
+        should: [
+          { term: { "numeroProcesso.keyword": digitsOnly } },
+          { term: { numeroProcesso: digitsOnly } },
+          {
+            match: {
+              numeroProcesso: {
+                query: digitsOnly,
+                operator: "and"
+              }
+            }
+          }
+        ],
+        minimum_should_match: 1
       }
     });
   } else if (trimmedTerm) {
     must.push({
-      multi_match: {
-        query: trimmedTerm,
-        fields: [
-          "numeroProcesso^4",
-          "classe.nome^2",
-          "assuntos.nome^2",
-          "orgaoJulgador.nome",
-          "movimentos.nome^3"
+      bool: {
+        should: [
+          {
+            multi_match: {
+              query: trimmedTerm,
+              fields: [
+                "numeroProcesso^4",
+                "classe.nome^2",
+                "assuntos.nome^2",
+                "orgaoJulgador.nome",
+                "movimentos.nome^3",
+                "movimentos.complementosTabelados.nome",
+                "movimentos.complementosTabelados.descricao"
+              ],
+              operator: "and",
+              type: "best_fields"
+            }
+          },
+          {
+            query_string: {
+              query: `"${trimmedTerm}"`,
+              fields: ["*"],
+              lenient: true
+            }
+          }
         ],
-        operator: "and",
-        type: "best_fields"
+        minimum_should_match: 1
       }
     });
   } else {
@@ -161,8 +281,25 @@ function buildSearchBody({ termo, dataInicio, dataFim, page, pageSize }) {
     }
 
     filter.push({
-      range: {
-        dataHoraUltimaAtualizacao: range
+      bool: {
+        should: [
+          {
+            range: {
+              dataHoraUltimaAtualizacao: range
+            }
+          },
+          {
+            range: {
+              dataAjuizamento: range
+            }
+          },
+          {
+            range: {
+              "movimentos.dataHora": range
+            }
+          }
+        ],
+        minimum_should_match: 1
       }
     });
   }
@@ -195,7 +332,9 @@ function buildSearchBody({ termo, dataInicio, dataFim, page, pageSize }) {
       "dataAjuizamento",
       "dataHoraUltimaAtualizacao",
       "movimentos.nome",
-      "movimentos.dataHora"
+      "movimentos.dataHora",
+      "movimentos.complementosTabelados.nome",
+      "movimentos.complementosTabelados.descricao"
     ]
   };
 }
@@ -242,7 +381,10 @@ function getLastMovement(movimentos) {
 
 export default function App() {
   const [tribunal, setTribunal] = useState("tjsp");
+  const [searchMode, setSearchMode] = useState("processo");
   const [termo, setTermo] = useState("");
+  const [oabNumero, setOabNumero] = useState("");
+  const [oabUf, setOabUf] = useState("SP");
   const [dataInicio, setDataInicio] = useState("");
   const [dataFim, setDataFim] = useState("");
   const [pageSize, setPageSize] = useState(DEFAULT_PAGE_SIZE);
@@ -267,14 +409,29 @@ export default function App() {
   const selectedTribunal = TRIBUNAIS.find((item) => item.value === tribunal);
   const endpoint = `/api-datajud/api_publica_${tribunal}/_search`;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  const inputLabel = searchMode === "processo" ? "Numero do processo" : "Termo de pesquisa";
+  const inputPlaceholder =
+    searchMode === "processo" ? "Ex: 0012045-65.2025.5.15.0083" : "Ex: intimacao, audiencia ou nome do orgao";
 
   async function runSearch(nextPage = 0) {
+    if (searchMode === "oab" && (!oabNumero.trim() || !oabUf)) {
+      setSearched(true);
+      setResults([]);
+      setTotal(0);
+      setTook(null);
+      setError("Informe o numero da OAB e o estado.");
+      return;
+    }
+
     setLoading(true);
     setError("");
     setSearched(true);
 
     const body = buildSearchBody({
+      searchMode,
       termo,
+      oabNumero,
+      oabUf,
       dataInicio,
       dataFim,
       page: nextPage,
@@ -323,7 +480,10 @@ export default function App() {
   }
 
   function handleReset() {
+    setSearchMode("processo");
     setTermo("");
+    setOabNumero("");
+    setOabUf("SP");
     setDataInicio("");
     setDataFim("");
     setPageSize(DEFAULT_PAGE_SIZE);
@@ -378,7 +538,7 @@ export default function App() {
           <div className="mb-5 flex items-center justify-between gap-3">
             <div>
               <h2 className="text-lg font-semibold text-slate-950">Parametros</h2>
-              <p className="mt-1 text-sm text-slate-600">Use numero CNJ, classe, assunto, orgao ou movimento.</p>
+              <p className="mt-1 text-sm text-slate-600">Use numero CNJ, OAB/UF ou termo publico.</p>
             </div>
             <button
               type="button"
@@ -392,6 +552,28 @@ export default function App() {
           </div>
 
           <div className="space-y-4">
+            <div>
+              <span className="mb-1.5 block text-sm font-medium text-slate-700">Tipo de busca</span>
+              <div className="grid grid-cols-3 rounded-lg border border-slate-300 bg-slate-50 p-1">
+                {SEARCH_MODES.map((mode) => (
+                  <button
+                    key={mode.value}
+                    type="button"
+                    onClick={() => {
+                      setSearchMode(mode.value);
+                      setError("");
+                    }}
+                    className={`h-9 rounded-md text-sm font-semibold transition ${
+                      searchMode === mode.value ? "bg-white text-emerald-700 shadow-sm" : "text-slate-600 hover:text-slate-950"
+                    }`}
+                    aria-pressed={searchMode === mode.value}
+                  >
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             <label className="block">
               <span className="mb-1.5 flex items-center gap-2 text-sm font-medium text-slate-700">
                 <Building2 className="h-4 w-4 text-emerald-700" aria-hidden="true" />
@@ -414,18 +596,57 @@ export default function App() {
               </select>
             </label>
 
-            <label className="block">
-              <span className="mb-1.5 flex items-center gap-2 text-sm font-medium text-slate-700">
-                <FileSearch className="h-4 w-4 text-emerald-700" aria-hidden="true" />
-                Termo de pesquisa
-              </span>
-              <input
-                value={termo}
-                onChange={(event) => setTermo(event.target.value)}
-                placeholder="Ex: 00008323520184013202 ou intimacao"
-                className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none ring-emerald-100 transition placeholder:text-slate-400 focus:border-emerald-600 focus:ring-4"
-              />
-            </label>
+            {searchMode === "oab" ? (
+              <div className="grid gap-3 sm:grid-cols-[1fr_120px] lg:grid-cols-1 xl:grid-cols-[1fr_120px]">
+                <label className="block">
+                  <span className="mb-1.5 flex items-center gap-2 text-sm font-medium text-slate-700">
+                    <IdCard className="h-4 w-4 text-emerald-700" aria-hidden="true" />
+                    Numero da OAB
+                  </span>
+                  <input
+                    value={oabNumero}
+                    onChange={(event) => setOabNumero(event.target.value)}
+                    placeholder="Ex: 345495"
+                    inputMode="numeric"
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none ring-emerald-100 transition placeholder:text-slate-400 focus:border-emerald-600 focus:ring-4"
+                  />
+                </label>
+
+                <label className="block">
+                  <span className="mb-1.5 text-sm font-medium text-slate-700">Estado</span>
+                  <select
+                    value={oabUf}
+                    onChange={(event) => setOabUf(event.target.value)}
+                    className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none ring-emerald-100 transition focus:border-emerald-600 focus:ring-4"
+                  >
+                    {UF_OPTIONS.map((uf) => (
+                      <option key={uf} value={uf}>
+                        {uf}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              </div>
+            ) : (
+              <label className="block">
+                <span className="mb-1.5 flex items-center gap-2 text-sm font-medium text-slate-700">
+                  <FileSearch className="h-4 w-4 text-emerald-700" aria-hidden="true" />
+                  {inputLabel}
+                </span>
+                <input
+                  value={termo}
+                  onChange={(event) => setTermo(event.target.value)}
+                  placeholder={inputPlaceholder}
+                  className="h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm text-slate-900 outline-none ring-emerald-100 transition placeholder:text-slate-400 focus:border-emerald-600 focus:ring-4"
+                />
+              </label>
+            )}
+
+            {searchMode === "oab" && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                A busca por OAB procura referencias publicas nos metadados e movimentos. A API publica do Datajud nao expoe OAB como campo estruturado garantido.
+              </div>
+            )}
 
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2">
               <label className="block">
@@ -490,6 +711,9 @@ export default function App() {
             <div>
               <p className="text-sm font-medium text-slate-500">Tribunal selecionado</p>
               <h2 className="mt-1 text-xl font-semibold text-slate-950">{selectedTribunal?.label}</h2>
+              <p className="mt-1 text-sm text-slate-600">
+                Busca atual: {searchMode === "oab" ? `OAB ${oabUf} ${oabNumero || "-"}` : searchMode === "processo" ? "numero CNJ" : "termo livre"}
+              </p>
             </div>
             <div className="rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-900">
               {searched ? `${total.toLocaleString("pt-BR")} processo(s) encontrados` : "Aguardando pesquisa"}
@@ -511,7 +735,7 @@ export default function App() {
               <FileText className="mx-auto h-10 w-10 text-emerald-700" aria-hidden="true" />
               <h3 className="mt-3 text-lg font-semibold text-slate-950">Pronto para consultar</h3>
               <p className="mx-auto mt-2 max-w-xl text-sm text-slate-600">
-                Escolha o tribunal, informe um numero CNJ ou termo de movimento, e envie a pesquisa.
+                Escolha o tribunal, selecione o tipo de busca e envie a pesquisa.
               </p>
             </div>
           )}
@@ -528,7 +752,9 @@ export default function App() {
             <div className="rounded-lg border border-slate-200 bg-white px-6 py-12 text-center shadow-soft">
               <Search className="mx-auto h-10 w-10 text-slate-400" aria-hidden="true" />
               <h3 className="mt-3 text-lg font-semibold text-slate-950">Nenhum resultado</h3>
-              <p className="mt-2 text-sm text-slate-600">Ajuste o termo, tribunal ou periodo e tente novamente.</p>
+              <p className="mt-2 text-sm text-slate-600">
+                Ajuste o termo, tribunal ou periodo. Para OAB, tente tambem sem filtro de datas.
+              </p>
             </div>
           )}
 
