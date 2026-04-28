@@ -13,7 +13,7 @@ import {
   Scale
 } from "lucide-react";
 
-const DATAJUD_API_KEY = "APIKey cDZHYzlZa0JadVREZDJCendQbXY6SkJITzNjLV9TRENyQk1RdnFKZGRQdw==";
+const DATAJUD_API_KEY = "APIKey cDZHYzlZa0JadVREZDJCendQbXY6SkJlTzNjLV9TRENyQk1RdnFKZGRQdw==";
 
 const TRIBUNAIS = [
   { group: "Tribunais Superiores", label: "TST - Tribunal Superior do Trabalho", value: "tst" },
